@@ -1,0 +1,239 @@
+#!/usr/bin/python3
+"""Wake a Claude Code session whose turn died on an API or network error, once the API answers again.
+
+StopFailure hook, run with "asyncRewake": true. Claude Code retries a failed request a few times,
+then ends the turn and leaves the session idle. This hook waits a backoff, polls the API host until
+it answers with any HTTP status, then exits 2 so the session wakes with the message on stderr.
+
+  - At most MAX_WAKES wakes per session in any rolling hour; past that it exits 0 and stays quiet.
+  - Backoff before polling grows with that session's wakes in the last hour (30s, 120s, 300s), so an
+    API that keeps failing while the network is fine cannot burn all the wakes in a minute.
+  - One waiter per session: a failure that arrives while a wait for that session is already running
+    is dropped.
+  - Gives up quietly (exit 0) if the API is still unreachable MAX_WAIT seconds after the hook started.
+
+State and log live in ~/.claude/net-rewake/ (state.json, log). Testing overrides: NET_REWAKE_URL,
+NET_REWAKE_BACKOFFS ("1,1,1"), NET_REWAKE_POLL, NET_REWAKE_MAX_WAIT, NET_REWAKE_STATE_DIR.
+"""
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.environ.get("NET_REWAKE_STATE_DIR") or os.path.join(HOME, ".claude", "net-rewake")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+LOG_FILE = os.path.join(STATE_DIR, "log")
+LOCK_FILE = os.path.join(STATE_DIR, ".lock")
+
+
+def env_float(name, default):
+    try:
+        return float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+
+
+def env_backoffs(name, default):
+    try:
+        values = [float(v) for v in os.environ[name].split(",") if v.strip()]
+    except (KeyError, ValueError):
+        return default
+    return values or default
+
+
+URL = os.environ.get("NET_REWAKE_URL") or "https://api.anthropic.com"
+BACKOFFS = env_backoffs("NET_REWAKE_BACKOFFS", [30.0, 120.0, 300.0])
+POLL = env_float("NET_REWAKE_POLL", 15.0)
+MAX_WAIT = env_float("NET_REWAKE_MAX_WAIT", 1800.0)  # from hook start, backoff included; the hook timeout is 1900s
+MAX_WAKES = 3
+WINDOW = 3600.0
+PROBE_TIMEOUT = 5.0
+LOG_MAX_BYTES = 1_000_000
+SCRIPT_NAME = os.path.basename(__file__)
+
+
+class Stopped(BaseException):
+    """Claude Code ended the hook (SIGTERM on timeout or session exit)."""
+
+
+def log(message):
+    try:
+        os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > LOG_MAX_BYTES:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-LOG_MAX_BYTES // 2, os.SEEK_END)
+                tail = f.read().split(b"\n", 1)[-1]
+            with open(LOG_FILE, "wb") as f:
+                f.write(tail)
+        with open(LOG_FILE, "a") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
+    except OSError:
+        pass
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return {"sessions": {}}
+    if not isinstance(state, dict) or not isinstance(state.get("sessions"), dict):
+        return {"sessions": {}}
+    return state
+
+
+def save_state(state):
+    tmp = f"{STATE_FILE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+@contextmanager
+def locked():
+    """Hold the state lock while yielding the pruned state; save it on the way out."""
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    with open(LOCK_FILE, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_state()
+        prune(state, time.time())
+        yield state
+        save_state(state)
+
+
+def waiter_alive(pending):
+    """True if `pending` names a running copy of this hook (a reused pid running something else is not)."""
+    try:
+        pid = int(pending.get("pid"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        out = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return SCRIPT_NAME in out
+
+
+def prune(state, now):
+    sessions = state["sessions"]
+    for sid in list(sessions):
+        entry = sessions[sid] if isinstance(sessions[sid], dict) else {}
+        wakes = entry.get("wakes") if isinstance(entry.get("wakes"), list) else []
+        wakes = [t for t in wakes if isinstance(t, (int, float)) and now - t < WINDOW]
+        pending = entry.get("pending")
+        if pending is not None and not waiter_alive(pending):
+            pending = None
+        if not wakes and pending is None:
+            del sessions[sid]
+            continue
+        sessions[sid] = {"wakes": wakes, **({"pending": pending} if pending else {})}
+
+
+def probe():
+    """(True, HTTP status) if the API host answered at all, else (False, why it did not)."""
+    request = urllib.request.Request(URL, headers={"User-Agent": "claude-net-rewake"})
+    try:
+        with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+            return True, f"HTTP {response.status}"
+    except urllib.error.HTTPError as e:  # any status means the network path works
+        return True, f"HTTP {e.code}"
+    except urllib.error.URLError as e:  # DNS, connect, TLS
+        return False, f"{type(e.reason).__name__}: {e.reason}"
+    except Exception as e:  # timeouts, resets mid-response
+        return False, f"{type(e).__name__}: {e}"
+
+
+def run():
+    raw = sys.stdin.read()
+    log("input " + (raw.strip().replace("\n", "\\n")[:4000] or "<empty>"))
+    try:
+        event = json.loads(raw)
+    except ValueError:
+        event = None
+    if not isinstance(event, dict) or not event.get("session_id"):
+        log("-------- no session_id in hook input; not waking")
+        return 0
+    session = str(event["session_id"])
+    error = str(event.get("error") or "unknown")
+    tag = f"{session[:8]} {error}:"
+
+    started = time.monotonic()  # monotonic: a sleeping Mac pauses this and Claude Code's hook timer alike
+    with locked() as state:
+        entry = state["sessions"].setdefault(session, {"wakes": []})
+        count = len(entry["wakes"])
+        pending = entry.get("pending")
+        if pending and pending.get("pid") != os.getpid():
+            log(f"{tag} skip, already waiting for this session (pid {pending.get('pid')})")
+            return 0
+        if count >= MAX_WAKES:
+            log(f"{tag} skip, capped ({count} wakes in the last hour)")
+            return 0
+        entry["pending"] = {"pid": os.getpid(), "since": time.time()}
+    backoff = BACKOFFS[min(count, len(BACKOFFS) - 1)]
+    log(f"{tag} wake {count + 1}/{MAX_WAKES}: backoff {backoff:g}s, then polling {URL} every {POLL:g}s")
+
+    outcome = None
+    try:
+        deadline = started + MAX_WAIT
+        time.sleep(max(0.0, min(backoff, deadline - time.monotonic())))
+        down = False
+        while True:
+            ok, detail = probe()
+            if ok:
+                outcome = detail
+                break
+            if not down:
+                down = True
+                log(f"{tag} API unreachable ({detail}); polling")
+            if time.monotonic() + POLL > deadline:
+                log(f"{tag} gave up, API unreachable after {(time.monotonic() - started) / 60:.1f} min ({detail})")
+                return 0
+            time.sleep(POLL)
+    except Stopped:
+        log(f"{tag} stopped by a signal before the API came back")
+        return 0
+    finally:
+        with locked() as state:
+            entry = state["sessions"].setdefault(session, {"wakes": []})
+            entry.pop("pending", None)
+            if outcome:
+                entry["wakes"].append(time.time())
+            elif not entry["wakes"]:
+                del state["sessions"][session]
+
+    log(f"{tag} reachable ({outcome}) after {time.monotonic() - started:.0f}s; waking session")
+    print(f"[net-rewake] The API connection is back after the earlier {error} error. "
+          "Continue the task you were working on from where you left off.", file=sys.stderr)
+    return 2  # asyncRewake: exit 2 wakes the session with the message above
+
+
+def main():
+    def stop(*_):
+        raise Stopped()
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):  # exit cleanly so the wait marker is cleared
+        signal.signal(sig, stop)
+    try:
+        return run()
+    except Stopped:
+        return 0
+    except Exception as e:
+        log(f"-------- error: {type(e).__name__}: {e}")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

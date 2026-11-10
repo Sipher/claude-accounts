@@ -1,0 +1,1135 @@
+#!/usr/bin/python3
+"""Keep several Claude subscription logins and swap between them automatically.
+
+Claude Code stores its login in the macOS keychain item "Claude Code-credentials"
+and re-reads it about every 30 seconds, so replacing that item moves every
+running session to another account without a restart. Each account's login is
+kept in its own keychain item (service "claude-accounts"); the live item is
+swapped on demand, or by the StopFailure hook when a usage limit is hit.
+
+  claude-accounts                   list accounts
+  claude-accounts add               log in another account (opens a login-only Claude window)
+  claude-accounts use <n|email>     switch now and hold that account for 3 hours
+  claude-accounts next              switch to the next best account and hold it for 3 hours
+  claude-accounts auto              stop holding; go back to the best account
+  claude-accounts balance           move to the best account now (what the watcher runs)
+  claude-accounts watcher on|off    run `balance` every 5 minutes in the background (launchd)
+  claude-accounts remove <n|email>  forget an account
+  claude-accounts sync              save the live login into its account slot
+  claude-accounts usage             usage of every account (also available as `claude-usage`)
+  claude-accounts prime             start every idle account's 5-hour window now (a one-word Haiku request)
+  claude-accounts hook              StopFailure hook entry point (hook JSON on stdin)
+
+"Best" means the usable account whose weekly limit resets soonest; see rank().
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import getpass
+import hashlib
+import json
+import os
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser("~")
+DATA_DIR = os.environ.get("CLAUDE_ACCOUNTS_DIR") or os.path.join(HOME, ".claude", "accounts")
+ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
+LOG_FILE = os.path.join(DATA_DIR, "log")
+SECURITY = os.environ.get("CLAUDE_ACCOUNTS_SECURITY") or "/usr/bin/security"
+SLOT_SERVICE = "claude-accounts"
+LIVE_SERVICE = "Claude Code-credentials"
+# Endpoints and OAuth client from Claude Code's bundled production config.
+API_BASE = os.environ.get("CLAUDE_ACCOUNTS_API_BASE") or "https://api.anthropic.com"
+TOKEN_URL = os.environ.get("CLAUDE_ACCOUNTS_TOKEN_URL") or "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+
+# Claude Code caches its keychain read for 30s; wait past that before waking a session.
+REWAKE_DELAY = float(os.environ.get("CLAUDE_ACCOUNTS_REWAKE_DELAY") or 32)
+# A limit error this soon after a swap usually came from a session still holding the old login.
+STALE_WINDOW = 90
+# How long to skip an account whose limit message had no readable reset time.
+FALLBACK_COOLDOWN = 3600
+
+# Stop choosing an account once it reaches these shares of its 5-hour window or its week.
+FIVE_HOUR_CAP = 90
+WEEK_CAP = 99
+DWELL = 15 * 60       # the balancer leaves a still-usable account at most this often
+HOLD = 3 * 3600       # how long `use` and `next` override the balancer
+CACHE_AGE = 30 * 60   # how old a usage reading may be when the API can't be reached
+FRESH_AGE = float(os.environ.get("CLAUDE_ACCOUNTS_FRESH_AGE") or 60)  # reuse a reading this young instead of asking again
+BACKOFF = 5 * 60      # after the usage API answers 429, leave that account alone at least this long
+LAUNCHD_LABEL = os.environ.get("CLAUDE_ACCOUNTS_LAUNCHD_LABEL") or "com.claude-accounts.balance"
+HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
+HISTORY_DAYS = 8
+DEFAULT_WINDOW_SHARE = 0.12  # share of a week one full 5-hour window uses, until measured
+MIN_SIGNAL = 40              # 5-hour percentage points of history needed to trust a measured share
+PRIME_MODEL = os.environ.get("CLAUDE_ACCOUNTS_PRIME_MODEL") or "haiku"
+PRIME_EVERY = 10 * 60      # the prompt hook checks for idle windows at most this often
+ALL_OUT_NOTICE = 15 * 60   # repeat the "all accounts unavailable" notification at most this often
+
+MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- keychain
+
+def keychain_user():
+    # Same rule Claude Code uses for the keychain item's account field.
+    user = os.environ.get("USER") or getpass.getuser()
+    return user if re.fullmatch(r"[A-Za-z0-9._-]+", user or "") else "claude-code-user"
+
+
+def live_service(config_dir=None):
+    """Keychain service Claude Code uses for a config dir (suffixed when CLAUDE_CONFIG_DIR is set)."""
+    if not config_dir:
+        return LIVE_SERVICE
+    digest = hashlib.sha256(unicodedata.normalize("NFC", config_dir).encode()).hexdigest()[:8]
+    return f"{LIVE_SERVICE}-{digest}"
+
+
+def kc_read(service, account):
+    r = subprocess.run([SECURITY, "find-generic-password", "-a", account, "-s", service, "-w"],
+                       capture_output=True, text=True, timeout=15)
+    return r.stdout.rstrip("\n") if r.returncode == 0 else None
+
+
+def kc_write(service, account, secret):
+    hexed = secret.encode().hex()
+    command = f'add-generic-password -U -a "{account}" -s "{service}" -X "{hexed}"\n'
+    if len(command) <= 4000:  # stdin keeps the secret out of `ps`; Claude Code falls back to argv past this length too
+        r = subprocess.run([SECURITY, "-i"], input=command, capture_output=True, text=True, timeout=15)
+    else:
+        r = subprocess.run([SECURITY, "add-generic-password", "-U", "-a", account, "-s", service, "-X", hexed],
+                           capture_output=True, text=True, timeout=15)
+    if kc_read(service, account) != secret:
+        raise Fail(f"could not write keychain item {service!r}: {(r.stderr or r.stdout).strip()}")
+
+
+def kc_delete(service, account):
+    subprocess.run([SECURITY, "delete-generic-password", "-a", account, "-s", service],
+                   capture_output=True, timeout=15)
+
+
+def kc_services(prefix):
+    r = subprocess.run([SECURITY, "dump-keychain"], capture_output=True, text=True, timeout=30)
+    return set(re.findall(r'"svce"<blob>="(' + re.escape(prefix) + r'[^"]*)"', r.stdout))
+
+
+# ---------------------------------------------------------------- files
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+
+
+def save_json(path, data, indent=None):
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except FileNotFoundError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=indent, ensure_ascii=False)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def global_config_path(config_dir=None):
+    return os.path.join(config_dir or HOME, ".claude.json")
+
+
+def read_profile(config_dir=None):
+    return load_json(global_config_path(config_dir), {}).get("oauthAccount")
+
+
+def write_profile(profile, config_dir=None):
+    path = global_config_path(config_dir)
+    config = load_json(path, None)
+    if config is None:
+        raise Fail(f"{path} not found")
+    config["oauthAccount"] = profile
+    save_json(path, config, indent=2)
+
+
+def log(message):
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {message}\n")
+
+
+def notify(message):
+    log(message)
+    if os.environ.get("CLAUDE_ACCOUNTS_NO_NOTIFY"):
+        return
+    script = f"display notification {json.dumps(message, ensure_ascii=False)} with title \"Claude accounts\""
+    subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
+
+
+class Store:
+    def __init__(self):
+        self.accounts = load_json(ACCOUNTS_FILE, {})  # id -> record; insertion order is rotation order
+        self.state = load_json(STATE_FILE, {})
+
+    def save(self):
+        save_json(ACCOUNTS_FILE, self.accounts, indent=2)
+        save_json(STATE_FILE, self.state, indent=2)
+
+    def label(self, acct):
+        profile = self.accounts.get(acct, {}).get("profile", {})
+        return profile.get("emailAddress") or "unknown account"
+
+
+@contextmanager
+def locked():
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    with open(os.path.join(DATA_DIR, ".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        store = Store()
+        yield store
+        store.save()
+
+
+# ---------------------------------------------------------------- core
+
+def account_id(profile):
+    key = f"{profile.get('accountUuid') or profile.get('emailAddress')}:{profile.get('organizationUuid') or ''}"
+    return hashlib.sha256(key.encode()).hexdigest()[:12]
+
+
+def fingerprint(oauth):
+    return hashlib.sha256((oauth.get("refreshToken") or "").encode()).hexdigest()[:16]
+
+
+def read_live():
+    raw = kc_read(live_service(os.environ.get("CLAUDE_CONFIG_DIR")), keychain_user())
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise Fail("the live Claude Code keychain item is not JSON; leaving it alone")
+
+
+def save_slot(store, acct, profile, oauth):
+    rec = store.accounts.setdefault(acct, {"added": int(time.time())})
+    rec["profile"] = profile
+    rec["plan"] = oauth.get("subscriptionType")
+    rec["tier"] = oauth.get("rateLimitTier")
+    kc_write(SLOT_SERVICE, acct, json.dumps(oauth, separators=(",", ":"), ensure_ascii=False))
+    rec["fp"] = fingerprint(oauth)
+    store.state.get("broken", {}).pop(acct, None)
+
+
+def sync(store):
+    """Save the live login into its account slot and return that account's id."""
+    live = read_live()
+    oauth = (live or {}).get("claudeAiOauth")
+    if not oauth or not oauth.get("refreshToken"):
+        return None
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    fp = fingerprint(oauth)
+    owner = next((a for a, rec in store.accounts.items() if rec.get("fp") == fp), None)
+    if owner is None:
+        # Claude refreshed the token or someone ran /login; Claude's own record says whose login it is.
+        profile = read_profile(config_dir)
+        if not profile:
+            return None
+        owner = account_id(profile)
+        if owner not in store.accounts:
+            log(f"registered {profile.get('emailAddress')}")
+        save_slot(store, owner, profile, oauth)
+    else:
+        profile = read_profile(config_dir)
+        if profile and account_id(profile) != owner:
+            # Something rewrote ~/.claude.json with the old profile after a swap; put it back.
+            write_profile(store.accounts[owner]["profile"], config_dir)
+    store.state["active"] = owner
+    return owner
+
+
+def switch_to(store, target, current):
+    slot = kc_read(SLOT_SERVICE, target)
+    if not slot:
+        raise Fail(f"no saved login for {store.label(target)}; run: claude-accounts add")
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    live = read_live() or {}
+    live["claudeAiOauth"] = json.loads(slot)  # other keys in the item (e.g. MCP logins) stay as they are
+    kc_write(live_service(config_dir), keychain_user(), json.dumps(live, separators=(",", ":"), ensure_ascii=False))
+    write_profile(store.accounts[target]["profile"], config_dir)
+    store.state["active"] = target
+    store.state["last_swap"] = {"at": time.time(), "from": current, "to": target}
+    log(f"switched {store.label(current)} -> {store.label(target)}")
+
+
+def zone(name):
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name.strip())
+        except Exception:
+            pass
+    return None  # local time
+
+
+def parse_reset(text, now):
+    """Best-effort reset time from a limit message such as 'resets 7pm (America/Sao_Paulo)'."""
+    iso = re.search(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?", text)
+    if iso:
+        try:
+            dt = datetime.fromisoformat(iso.group(0).replace("Z", "+00:00"))
+            return dt.timestamp() + 60
+        except ValueError:
+            pass
+    rel = re.search(r"resets?\s+in\s+(?:(\d+)\s*d\w*\s*)?(?:(\d+)\s*h\w*\s*)?(?:(\d+)\s*m\w*)?", text, re.I)
+    if rel and any(rel.groups()):
+        d, h, m = (int(g or 0) for g in rel.groups())
+        return now + d * 86400 + h * 3600 + m * 60 + 60
+    m = re.search(r"resets?\s+(?:today\s+|tomorrow\s+)?(?:at\s+|on\s+)?"
+                  r"(?:([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?"
+                  r"(\d{1,2})(?::(\d{2}))?\s*([ap]\.?m\.?)?(?:\s*\(([^)]+)\))?", text, re.I)
+    if not m:
+        return None
+    mon, day, hour, minute, ampm, tzname = m.groups()
+    if not ampm and minute is None:
+        return None  # a bare number is too ambiguous
+    hour = int(hour)
+    if ampm:
+        hour = hour % 12 + (12 if ampm.lower().startswith("p") else 0)
+    base = datetime.fromtimestamp(now, zone(tzname))
+    try:
+        when = base.replace(hour=hour, minute=int(minute or 0), second=0, microsecond=0)
+        if mon:
+            month = MONTHS.get(mon[:3].lower())
+            if not month:
+                return None
+            when = when.replace(month=month, day=int(day))
+            if when.timestamp() < now - 86400:
+                when = when.replace(year=when.year + 1)
+        elif when.timestamp() <= now:
+            when += timedelta(days=1)
+    except ValueError:
+        return None
+    return when.timestamp() + 60
+
+
+def fmt_time(ts):
+    dt = datetime.fromtimestamp(ts)
+    return dt.strftime("%H:%M") if dt.date() == datetime.now().date() else dt.strftime("%b %d %H:%M")
+
+
+def resolve(store, query):
+    ids = list(store.accounts)
+    if query.isdigit() and 1 <= int(query) <= len(ids):
+        return ids[int(query) - 1]
+    emails = {a: (store.accounts[a].get("profile", {}).get("emailAddress") or "").lower() for a in ids}
+    exact = [a for a in ids if emails[a] == query.lower()]
+    partial = [a for a in ids if query.lower() in emails[a]]
+    matches = exact or partial
+    if len(matches) != 1:
+        raise Fail(f"{query!r} matches {len(matches)} accounts; use the number from `claude-accounts list`")
+    return matches[0]
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_list(args):
+    with locked() as store:
+        sync(store)
+        if not store.accounts:
+            print("No accounts saved yet. Run: claude-accounts add")
+            return 0
+        now = time.time()
+        width = max(len(store.label(a)) for a in store.accounts)
+        for n, (acct, rec) in enumerate(store.accounts.items(), 1):
+            active = acct == store.state.get("active")
+            if acct in store.state.get("broken", {}):
+                status = "login expired, re-add it"
+            elif store.state.get("limited", {}).get(acct, 0) > now:
+                status = f"limited until ~{fmt_time(store.state['limited'][acct])}"
+            else:
+                status = "ok"
+            org = rec.get("profile", {}).get("organizationName") or ""
+            print(f"{'*' if active else ' '} {n}  {store.label(acct):<{width}}  {rec.get('plan') or '?':<5}  "
+                  f"{status:<28}  {org}")
+    return 0
+
+
+def cmd_sync(args):
+    with locked() as store:
+        acct = sync(store)
+        if not args.quiet:
+            print(f"Saved login for {store.label(acct)}." if acct else "No Claude subscription login found.")
+    return 0
+
+
+def hold(store, acct):
+    store.state["held"] = {"acct": acct, "until": time.time() + HOLD}
+    return (f"Now using {store.label(acct)}; running sessions pick it up within 30 seconds.\n"
+            f"Holding it until {fmt_time(store.state['held']['until'])} unless it hits a limit "
+            "(claude-accounts auto to release).")
+
+
+def cmd_use(args):
+    with locked() as store:
+        current = sync(store)
+        target = resolve(store, args.account)
+        store.state.get("limited", {}).pop(target, None)
+        store.state.get("broken", {}).pop(target, None)
+        if target != current:
+            switch_to(store, target, current)
+        print(hold(store, target))
+    return 0
+
+
+def cmd_next(args):
+    with locked() as store:
+        current = sync(store)
+        usage, _ = fetch_all(store, current)
+        target = choose(store, usage, time.time(), exclude=current)
+        if target is None:
+            print("No other account is available right now.")
+            return 1
+        switch_to(store, target, current)
+        print(hold(store, target))
+    return 0
+
+
+def cmd_auto(args):
+    with locked() as store:
+        store.state.pop("held", None)
+    print("Released; the best account is chosen automatically again.")
+    args.force = True
+    return cmd_balance(args)
+
+
+def cmd_remove(args):
+    with locked() as store:
+        target = resolve(store, args.account)
+        if target == sync(store):
+            raise Fail(f"{store.label(target)} is the live login; switch to another account first")
+        label = store.label(target)
+        kc_delete(SLOT_SERVICE, target)
+        del store.accounts[target]
+        for key in ("limited", "broken"):
+            store.state.get(key, {}).pop(target, None)
+        print(f"Removed {label}.")
+    return 0
+
+
+def cmd_add(args):
+    with locked() as store:
+        sync(store)  # make sure the account that's logged in right now has a slot
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    login_dir = tempfile.mkdtemp(prefix="login-", dir=DATA_DIR)
+    service, user = live_service(login_dir), keychain_user()
+    before = kc_services(LIVE_SERVICE + "-")
+    # A separate config dir keeps this login away from the live one; no API keys so it asks for a subscription login.
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC_"))}
+    env["CLAUDE_CONFIG_DIR"] = login_dir
+    print("A login-only Claude Code window is opening.\n"
+          "  1. Pick \"Claude account with subscription\" and log in with the account to add.\n"
+          "  2. Once it reaches the prompt, type /exit.\n")
+    try:
+        subprocess.run([claude_bin()], env=env, cwd=login_dir)
+        raw = kc_read(service, user)
+        if raw is None:
+            new = kc_services(LIVE_SERVICE + "-") - before
+            if len(new) == 1:
+                service = new.pop()
+                raw = kc_read(service, user)
+        oauth = json.loads(raw).get("claudeAiOauth") if raw else None
+        profile = read_profile(login_dir)
+        if not oauth or not oauth.get("refreshToken") or not profile:
+            raise Fail("no subscription login found in that window (log in fully before /exit)")
+        with locked() as store:
+            acct = account_id(profile)
+            save_slot(store, acct, profile, oauth)
+            store.state.get("limited", {}).pop(acct, None)
+            print(f"Added {store.label(acct)}. Accounts now:")
+    finally:
+        kc_delete(service, user)
+        shutil.rmtree(login_dir, ignore_errors=True)
+    return cmd_list(args)
+
+
+def cmd_hook(args):
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        event = {}
+    error = event.get("error") or ""
+    session = event.get("session_id") or ""
+    text = " ".join(str(event.get(k) or "") for k in ("error_details", "last_assistant_message"))
+    with locked() as store:
+        now = time.time()
+        current = sync(store)
+        if current is None or len(store.accounts) < 2:
+            return 0
+        rewakes = store.state.setdefault("rewakes", {})
+        woken = rewakes.get(session, 0)  # when this session was last woken (or will be)
+        if now < woken:
+            return 0  # a retry is already scheduled; parallel agents of one session fail together
+        last = store.state.get("last_swap") or {}
+        usage, errors = fetch_all(store, current, force={current})
+        known = current in usage and current not in errors
+        over = any((window(usage.get(current), key)[0] or 0) >= 100 for key in ("five_hour", "seven_day"))
+        # Woken after the latest swap and failed again within 10 minutes: its current login really is limited
+        # (possibly by a window the usage API doesn't report).
+        retried = now - woken < 600 and woken >= last.get("at", 0) + REWAKE_DELAY - 1
+        if error == "authentication_failed" or over or retried:
+            genuine = True
+        elif known:
+            genuine = False  # the live login has room, so the failure came from a login cached before a swap
+        else:
+            genuine = not (current == last.get("to") and now - last.get("at", 0) < STALE_WINDOW)
+        if not genuine:
+            old = last.get("from") if current == last.get("to") else current
+        else:
+            old = current
+            if error == "authentication_failed":
+                store.state.setdefault("broken", {})[current] = now
+            else:
+                reset = parse_reset(text, now) or now + FALLBACK_COOLDOWN
+                store.state.setdefault("limited", {})[current] = reset
+            store.state.pop("held", None)
+            target = choose(store, usage, now, exclude=current)
+            if target is None:
+                limited = [t for t in store.state.get("limited", {}).values() if t > now]
+                when = f"; earliest reset ~{fmt_time(min(limited))}" if limited else ""
+                if now - store.state.get("all_out_notice", 0) > ALL_OUT_NOTICE:
+                    store.state["all_out_notice"] = now
+                    notify(f"All Claude accounts are unavailable{when}.")
+                else:
+                    log(f"all accounts still unavailable{when} (notification suppressed)")
+                return 0
+            switch_to(store, target, current)
+            notify(f"{store.label(current)} hit its limit; switched to {store.label(target)}.")
+        # Wake once Claude's 30s keychain cache can no longer hold the login from before the last swap.
+        wake_at = max((store.state.get("last_swap") or {}).get("at", 0) + REWAKE_DELAY, time.time())
+        rewakes[session] = wake_at
+        for s in [s for s, t in rewakes.items() if now - t > 86400]:
+            del rewakes[s]
+        old_label, new_label = store.label(old), store.label(store.state["active"])
+    time.sleep(max(0.0, wake_at - time.time()))
+    what = (f"{old_label} hit its Claude usage limit, so Claude Code switched to {new_label}." if old_label != new_label
+            else f"Claude Code is on {new_label}, which still has room; the limit error came from an older login.")
+    print(f"claude-accounts: {what} Continue the interrupted task from where it stopped.", file=sys.stderr)
+    return 2  # asyncRewake: exit 2 wakes the session with the message above
+
+
+# ---------------------------------------------------------------- usage
+
+class HttpError(Fail):
+    def __init__(self, status, body, retry_after=None):
+        try:
+            message = json.loads(body)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            message = " ".join(body.split())[:120]
+        super().__init__(f"HTTP {status}: {message}")
+        self.status, self.body, self.retry_after = status, body, retry_after
+
+
+def http_json(url, token=None, body=None):
+    headers = {"Content-Type": "application/json", "User-Agent": "claude-accounts"}
+    if token:
+        headers.update({"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"})
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as e:
+        retry_after = e.headers.get("Retry-After") if e.headers else None
+        raise HttpError(e.code, e.read().decode(errors="replace")[:500],
+                        int(retry_after) if retry_after and retry_after.isdigit() else None)
+    except (urllib.error.URLError, OSError) as e:
+        raise Fail(f"network error: {getattr(e, 'reason', e)}")
+
+
+def refresh_login(store, acct, oauth):
+    try:
+        data = http_json(TOKEN_URL, body={"grant_type": "refresh_token", "refresh_token": oauth["refreshToken"],
+                                          "client_id": oauth.get("clientId") or CLIENT_ID})
+    except HttpError as e:
+        if "invalid_grant" in e.body:
+            store.state.setdefault("broken", {})[acct] = time.time()
+            raise Fail("login expired; run: claude-accounts add")
+        raise
+    new = dict(oauth, accessToken=data["access_token"], refreshToken=data.get("refresh_token") or oauth["refreshToken"])
+    if data.get("expires_in"):
+        new["expiresAt"] = int((time.time() + data["expires_in"]) * 1000)
+    if data.get("scope"):
+        new["scopes"] = data["scope"].split()
+    return new
+
+
+def fresh_login(store, acct, active, force=False):
+    """The account's claudeAiOauth with a usable access token, refreshing and saving it when expired."""
+    if active:
+        oauth = (read_live() or {}).get("claudeAiOauth")
+    else:
+        slot = kc_read(SLOT_SERVICE, acct)
+        oauth = json.loads(slot) if slot else None
+    if not oauth:
+        raise Fail("no saved login; run: claude-accounts add")
+    if not force and oauth.get("expiresAt", 0) > (time.time() + 300) * 1000:
+        return oauth
+    new = refresh_login(store, acct, oauth)
+    if active:
+        # Same compare-and-swap Claude Code does: only replace the live login if nobody refreshed it meanwhile.
+        live = read_live() or {}
+        if (live.get("claudeAiOauth") or {}).get("refreshToken") != oauth["refreshToken"]:
+            return new
+        live["claudeAiOauth"] = new
+        kc_write(live_service(os.environ.get("CLAUDE_CONFIG_DIR")), keychain_user(),
+                 json.dumps(live, separators=(",", ":"), ensure_ascii=False))
+    save_slot(store, acct, store.accounts[acct]["profile"], new)
+    return new
+
+
+def fetch_usage(store, acct, active):
+    url = API_BASE + "/api/oauth/usage"
+    try:
+        return http_json(url, token=fresh_login(store, acct, active)["accessToken"])
+    except HttpError as e:
+        if e.status != 401:
+            raise
+        return http_json(url, token=fresh_login(store, acct, active, force=True)["accessToken"])
+
+
+def usage_rows(data):
+    rows = [("5h", data.get("five_hour")), ("7d", data.get("seven_day")),
+            ("snt", data.get("seven_day_sonnet")), ("opus", data.get("seven_day_opus"))]
+    rows += [((m.get("display_name") or "model").lower()[:5], m) for m in data.get("model_scoped") or []]
+    return [(label, w) for label, w in rows if isinstance(w, dict) and w.get("utilization") is not None]
+
+
+def parse_ts(value):
+    if isinstance(value, (int, float)):
+        return value / 1000 if value > 1e12 else value
+    if not isinstance(value, str):
+        return None
+    # fromisoformat on Python 3.9 wants 'Z' spelled out and exactly 3 or 6 fraction digits.
+    text = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], value.replace("Z", "+00:00"))
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def fmt_reset(value):
+    ts = parse_ts(value)
+    if ts is None:
+        return ""
+    dt, now = datetime.fromtimestamp(ts), datetime.now()
+    if dt.date() == now.date():
+        return dt.strftime("%H:%M")
+    return dt.strftime("%a %H:%M") if (dt - now).days < 6 else dt.strftime("%b %d %H:%M")
+
+
+def plan_label(rec):
+    tier = re.search(r"(\d+x)$", rec.get("tier") or "")
+    return (rec.get("plan") or "?").upper() + (f" {tier.group(1)}" if tier else "")
+
+
+# ---------------------------------------------------------------- scheduling
+
+def window(data, key):
+    """(utilization %, reset timestamp) of one usage window, or (None, None)."""
+    w = (data or {}).get(key)
+    if not isinstance(w, dict) or w.get("utilization") is None:
+        return None, None
+    return w["utilization"], parse_ts(w.get("resets_at"))
+
+
+def multiplier(rec):
+    """Size of the plan in Pro units: 5 for Max 5x, 20 for Max 20x."""
+    tier = re.search(r"(\d+)x$", rec.get("tier") or "")
+    if tier:
+        return int(tier.group(1))
+    return 5 if rec.get("plan") == "max" else 1
+
+
+def fetch_all(store, active, force=()):
+    """Usage of every account. The usage API is rate-limited, so a reading under a minute old is reused
+    (except for accounts in `force`), and after a 429 an account is left alone for a while."""
+    usage, errors, fresh = {}, {}, {}
+    cache = store.state.setdefault("usage", {})
+    backoff = store.state.setdefault("usage_backoff", {})
+    now = time.time()
+    for acct in store.accounts:
+        cached = cache.get(acct)
+        if acct not in force and cached and now - cached["at"] < FRESH_AGE:
+            usage[acct] = cached["data"]
+            continue
+        try:
+            if acct not in force and backoff.get(acct, 0) > now:
+                raise Fail(f"usage API is rate-limiting; asking again after {fmt_time(backoff[acct])}")
+            usage[acct] = fresh[acct] = fetch_usage(store, acct, acct == active)
+            cache[acct] = {"at": now, "data": usage[acct]}
+            backoff.pop(acct, None)
+            store.state.get("broken", {}).pop(acct, None)  # a live reading means the login works again
+        except Fail as e:
+            if isinstance(e, HttpError) and e.status == 429:
+                backoff[acct] = now + max(e.retry_after or 0, BACKOFF)
+                e = Fail(f"usage API is rate-limiting; asking again after {fmt_time(backoff[acct])}")
+            errors[acct] = str(e)
+            if cached and now - cached["at"] < CACHE_AGE:
+                usage[acct] = cached["data"]
+                errors[acct] += f" · showing the reading from {max(1, round((now - cached['at']) / 60))} min ago"
+    for acct in [a for a in cache if a not in store.accounts]:
+        del cache[acct]
+    record_history(fresh, now)
+    return usage, errors
+
+
+def record_history(fresh, now):
+    """Keep a reading per account at most every minute; window_shares() learns from them."""
+    history = load_json(HISTORY_FILE, {})
+    for acct, data in fresh.items():
+        five, five_reset = window(data, "five_hour")
+        week, week_reset = window(data, "seven_day")
+        if five is None or week is None:
+            continue
+        samples = [s for s in history.get(acct, []) if now - s[0] < HISTORY_DAYS * 86400]
+        if not samples or now - samples[-1][0] >= 60:
+            samples.append([round(now), five, five_reset, week, week_reset])
+        history[acct] = samples
+    save_json(HISTORY_FILE, history)
+
+
+def window_shares(store):
+    """Per account: (share of a week one full 5-hour window uses, whether it was measured).
+
+    Both windows count the same requests, so inside one 5-hour window and one week the two
+    percentages rise in a fixed ratio. Accounts without enough history borrow the pooled ratio.
+    """
+    history = load_json(HISTORY_FILE, {})
+    sums = {}
+    for acct, samples in history.items():
+        five_up = week_up = 0.0
+        for (_, f0, fr0, w0, wr0), (_, f1, fr1, w1, wr1) in zip(samples, samples[1:]):
+            same_windows = fr0 and fr1 and abs(fr1 - fr0) < 120 and wr0 and wr1 and abs(wr1 - wr0) < 3600
+            if same_windows and f1 >= f0 and w1 >= w0:
+                five_up += f1 - f0
+                week_up += w1 - w0
+        sums[acct] = (five_up, week_up)
+    pooled_five = sum(f for f, _ in sums.values())
+    pooled = sum(w for _, w in sums.values()) / pooled_five if pooled_five >= MIN_SIGNAL else None
+    shares = {}
+    for acct in store.accounts:
+        five_up, week_up = sums.get(acct, (0.0, 0.0))
+        if five_up >= MIN_SIGNAL and week_up > 0:
+            shares[acct] = (week_up / five_up, True)
+        elif pooled:
+            shares[acct] = (pooled, True)
+        else:
+            shares[acct] = (DEFAULT_WINDOW_SHARE, False)
+    return shares
+
+
+def back_at(ts):
+    return f" · back {fmt_reset(ts)}" if ts else ""
+
+
+def rank(store, usage, now):
+    """Accounts best-first as (id, usable, reason).
+
+    Weekly allowance comes back at each account's weekly reset whether it was used or not, so drawing
+    from the account that resets soonest always leaves the most allowance for the rest of the week.
+    Resets within the same hour go to the smaller plan, keeping the big one in reserve.
+    """
+    limited, broken = store.state.get("limited", {}), store.state.get("broken", {})
+    usable, unknown, blocked = [], [], []
+    for acct in store.accounts:
+        data = usage.get(acct)
+        five, five_reset = window(data, "five_hour")
+        week, week_reset = window(data, "seven_day")
+        mult = multiplier(store.accounts[acct])
+        if acct in broken:
+            blocked.append((acct, float("inf"), "login expired"))
+        elif limited.get(acct, 0) > now:
+            blocked.append((acct, limited[acct], f"hit its limit · back ~{fmt_time(limited[acct])}"))
+        elif week is not None and week >= WEEK_CAP:
+            blocked.append((acct, week_reset or float("inf"), f"week at {week:.0f}%{back_at(week_reset)}"))
+        elif five is not None and five >= FIVE_HOUR_CAP:
+            blocked.append((acct, five_reset or float("inf"), f"5h at {five:.0f}%{back_at(five_reset)}"))
+        elif week is None:
+            unknown.append((acct, mult, "usage unknown"))
+        else:
+            # A week that hasn't started yet starts with the next request.
+            week_reset = week_reset or now + 7 * 86400
+            usable.append((acct, week_reset, mult, f"week resets {fmt_reset(week_reset)} · {100 - week:.0f}% left"))
+    usable.sort(key=lambda entry: entry[1])
+    ordered = []
+    while usable:  # resets less than an hour after the earliest one count as a tie
+        tied = [entry for entry in usable if entry[1] - usable[0][1] < 3600]
+        ordered += sorted(tied, key=lambda entry: (entry[2], entry[1]))
+        usable = usable[len(tied):]
+    unknown.sort(key=lambda entry: entry[1])
+    blocked.sort(key=lambda entry: entry[1])
+    return ([(a, True, r) for a, _, _, r in ordered] + [(a, True, r) for a, _, r in unknown]
+            + [(a, False, r) for a, _, r in blocked])
+
+
+def choose(store, usage, now, exclude=None):
+    return next((a for a, ok, _ in rank(store, usage, now) if ok and a != exclude), None)
+
+
+def cmd_balance(args):
+    with locked() as store:
+        now = time.time()
+        current = sync(store)
+        if current is None or len(store.accounts) < 2:
+            return 0
+        usage, _ = fetch_all(store, current)
+        order = rank(store, usage, now)
+        best = next(((a, r) for a, ok, r in order if ok), None)
+        current_ok = any(a == current and ok for a, ok, _ in order)
+        held = store.state.get("held") or {}
+        if held and (held.get("acct") != current or held.get("until", 0) <= now or not current_ok):
+            store.state.pop("held", None)
+            held = {}
+        if best is None or best[0] == current:
+            decision = "staying"
+        elif held:
+            decision = f"held until {fmt_time(held['until'])}"
+        elif (current_ok and not getattr(args, "force", False)
+              and now - (store.state.get("last_swap") or {}).get("at", 0) < DWELL):
+            decision = "switched recently; waiting"
+        else:
+            switch_to(store, best[0], current)
+            log(f"balance: {store.label(best[0])} because {best[1]}")
+            notify(f"Switched to {store.label(best[0])}: {best[1]}.")
+            decision = "switched"
+        if not getattr(args, "quiet", False):
+            for n, (acct, ok, reason) in enumerate(order, 1):
+                mark = "*" if acct == store.state.get("active") else " "
+                print(f"{mark} {n}  {store.label(acct):<28} {reason}")
+            print(f"-> {decision}")
+    return 0
+
+
+def plist_path():
+    return os.path.join(HOME, "Library", "LaunchAgents", LAUNCHD_LABEL + ".plist")
+
+
+def watcher_plist():
+    return {
+        "Label": LAUNCHD_LABEL,
+        "ProgramArguments": [os.path.realpath(__file__), "balance", "--quiet"],
+        "StartInterval": 300,
+        "RunAtLoad": True,
+        "ProcessType": "Background",
+        "EnvironmentVariables": {"HOME": HOME, "USER": keychain_user(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+        "StandardOutPath": os.path.join(DATA_DIR, "watcher.log"),
+        "StandardErrorPath": os.path.join(DATA_DIR, "watcher.log"),
+    }
+
+
+def watcher_on():
+    r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True)
+    return r.returncode == 0
+
+
+def cmd_watcher(args):
+    target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    if args.action == "on":
+        os.makedirs(os.path.dirname(plist_path()), exist_ok=True)
+        os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+        with open(plist_path(), "wb") as f:
+            plistlib.dump(watcher_plist(), f)
+        subprocess.run(["launchctl", "bootout", target], capture_output=True)
+        r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist_path()],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Fail(f"launchctl bootstrap failed: {(r.stderr or r.stdout).strip()}")
+        print("Watcher on: picks the best account every 5 minutes, also after restarts.")
+    elif args.action == "off":
+        subprocess.run(["launchctl", "bootout", target], capture_output=True)
+        if os.path.exists(plist_path()):
+            os.remove(plist_path())
+        print("Watcher off.")
+    else:
+        print("Watcher on." if watcher_on() else "Watcher off.")
+    return 0
+
+
+# ---------------------------------------------------------------- heartbeats
+#
+# An account's 5-hour window starts with its first request and resets 5 hours later. Starting every
+# account's window when work starts makes them all reset together, and an early start never costs
+# capacity: an unused window just lapses, a used one resets sooner.
+
+def claude_bin():
+    return os.environ.get("CLAUDE_BIN") or shutil.which("claude") or os.path.join(HOME, ".local", "bin", "claude")
+
+
+def heartbeat(token):
+    """Start an account's 5-hour window with a one-word Haiku request made through Claude Code itself."""
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="prime-", dir=DATA_DIR) as tmp:
+        # A throwaway config dir: none of your settings, hooks, plugins, MCP servers or CLAUDE.md load.
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC_"))}
+        env.update(CLAUDE_CONFIG_DIR=tmp, CLAUDE_CODE_OAUTH_TOKEN=token, CLAUDE_ACCOUNTS_PRIMING="1")
+        try:
+            r = subprocess.run([claude_bin(), "-p", "hi", "--model", PRIME_MODEL, "--system-prompt", "Reply with OK.",
+                                "--tools", "", "--strict-mcp-config", "--no-session-persistence"],
+                               env=env, cwd=tmp, capture_output=True, text=True, timeout=120)
+        except subprocess.TimeoutExpired:
+            raise Fail("heartbeat timed out")
+        finally:
+            kc_delete(live_service(tmp), keychain_user())
+    if r.returncode != 0:
+        raise Fail(f"heartbeat failed: {(r.stderr or r.stdout).strip()[:200]}")
+
+
+def window_open(data, now):
+    _, reset = window(data, "five_hour")
+    return reset is not None and reset > now
+
+
+def cmd_prime(args):
+    if os.environ.get("CLAUDE_ACCOUNTS_PRIMING"):
+        return 0  # never prime from inside a heartbeat
+    with locked() as store:
+        now = time.time()
+        if args.auto and now - store.state.get("prime_check", 0) < PRIME_EVERY:
+            return 0
+        store.state["prime_check"] = now
+        current = sync(store)
+        usage, errors = fetch_all(store, current)
+        report, tokens = {}, {}
+        for acct in store.accounts:
+            data = usage.get(acct)
+            week, _ = window(data, "seven_day")
+            if acct in store.state.get("broken", {}):
+                report[acct] = "skipped: login expired"
+            elif data is None:
+                report[acct] = f"skipped: {errors.get(acct, 'usage unknown')}"
+            elif window_open(data, now):
+                report[acct] = f"already running · resets {fmt_reset(window(data, 'five_hour')[1])}"
+            elif week is not None and week >= 100:
+                report[acct] = "skipped: weekly limit reached"
+            elif args.auto and acct == current:
+                report[acct] = "starts with your prompt"
+            else:
+                try:
+                    tokens[acct] = fresh_login(store, acct, acct == current)["accessToken"]
+                except Fail as e:
+                    report[acct] = f"skipped: {e}"
+        labels = {a: store.label(a) for a in store.accounts}
+    # Each heartbeat takes a few seconds: send them together, outside the lock.
+    failed = {}
+    def beat(acct):
+        try:
+            heartbeat(tokens[acct])
+        except Fail as e:
+            failed[acct] = str(e)
+    threads = [threading.Thread(target=beat, args=(acct,)) for acct in tokens]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    pending = [a for a in tokens if a not in failed]
+    for attempt in range(3):  # the usage API can take a moment to show a new window
+        if not pending:
+            break
+        if attempt:
+            time.sleep(3)
+        with locked() as store:
+            usage, _ = fetch_all(store, store.state.get("active"), force=set(pending))
+        for acct in [a for a in pending if window_open(usage.get(a), time.time())]:
+            report[acct] = f"window started · resets {fmt_reset(window(usage[acct], 'five_hour')[1])}"
+            pending.remove(acct)
+    for acct in failed:
+        report[acct] = f"failed: {failed[acct]}"
+    for acct in pending:
+        report[acct] = "heartbeat sent, but the usage API doesn't show a window yet"
+    for acct in tokens:
+        log(f"prime {labels[acct]}: {report[acct]}")
+    if not args.auto:
+        for acct, label in labels.items():
+            print(f"  {label:<28} {report[acct]}")
+    return 0
+
+
+def hook_installed(event, command):
+    hooks = load_json(os.path.join(HOME, ".claude", "settings.json"), {}).get("hooks", {})
+    return any(command in h.get("command", "") for matcher in hooks.get(event, []) for h in matcher.get("hooks", []))
+
+
+def autoswap_on():
+    return hook_installed("StopFailure", "claude-accounts hook")
+
+
+ORANGE, GREEN, YELLOW, RED, DIM, BOLD = "38;5;209", "38;5;114", "38;5;221", "38;5;203", "2", "1"
+
+
+def render_usage(store, active, results, order, color):
+    def paint(text, *codes):
+        codes = [c for c in codes if c]
+        return f"\033[{';'.join(codes)}m{text}\033[0m" if color and codes else text
+
+    def level(pct):
+        return GREEN if pct < 50 else YELLOW if pct < 80 else RED
+
+    def gauge(pct, width, full, empty):
+        n = round(min(max(pct, 0), 100) / 100 * width)
+        return paint(full * n, level(pct)) + paint(empty * (width - n), DIM)
+
+    now = time.time()
+    stamp = datetime.now().strftime("%a %d %b · %H:%M").lower()
+    out = [paint(" ░▒▓", ORANGE) + paint(" CLAUDE USAGE ", BOLD) + paint("▓▒░", ORANGE)
+           + " " * (59 - 21 - len(stamp)) + paint(stamp, DIM), ""]
+    # Fuel in full 5x windows of work, so the 5h and week lines share one unit. Expired logins add nothing.
+    now_cap = now_left = week_cap = week_left = 0.0
+    five_back, week_refill, week_capped = [], {}, False
+    shares, estimated = window_shares(store), False
+    for acct, data, error in results:
+        rec, is_active = store.accounts[acct], acct == active
+        rows = usage_rows(data or {})
+        util = {label: w["utilization"] for label, w in rows}
+        limited_until = store.state.get("limited", {}).get(acct, 0)
+        five, five_reset = window(data, "five_hour")
+        week, week_reset = window(data, "seven_day")
+        windows = multiplier(rec) / 5
+        if data is not None and acct not in store.state.get("broken", {}):
+            share, measured = shares[acct]
+            estimated = estimated or not measured
+            week_room = max(0.0, 100 - (week or 0))
+            now_cap += windows
+            week_cap += windows / share
+            week_left += week_room / 100 * windows / share
+            if limited_until <= now and week_room > 0:
+                # Only the 5-hour room this account can actually use before its week runs out counts.
+                five_room = max(0.0, 100 - (five or 0))
+                now_left += min(five_room, week_room / share) / 100 * windows
+                week_capped = week_capped or week_room / share < five_room - 2
+            if five_reset and five_reset > now and (five or 0) > 0:
+                five_back.append(five_reset)
+            if week_reset and week_reset > now and (week or 0) > 0:
+                week_refill[week_reset] = week_refill.get(week_reset, 0) + (week or 0) / 100 * windows / share
+        if acct in store.state.get("broken", {}):
+            flag = "  · login expired"
+        elif limited_until > now or util.get("5h", 0) >= 100 or util.get("7d", 0) >= 100:
+            flag = f"  · limited until ~{fmt_time(limited_until)}" if limited_until > now else "  · limited"
+        else:
+            flag = ""
+        out.append(" " + (paint("▶", ORANGE) if is_active else " ") + " "
+                   + paint(store.label(acct), BOLD if is_active else "") + "  " + paint(f"[{plan_label(rec)}]", DIM)
+                   + (paint("  ← active", ORANGE) if is_active else "") + paint(flag, RED))
+        if error and acct not in store.state.get("broken", {}):
+            out.append("   " + paint(f"! {error}", RED))
+        width = max([3] + [len(label) for label, _ in rows])
+        for label, w in rows:
+            pct = w["utilization"]
+            reset = fmt_reset(w.get("resets_at"))
+            out.append(f"   {label:<{width}}  [{gauge(pct, 18, '■', '·')}] "
+                       + paint(f"{int(pct):>3}%", level(pct)) + (paint(f"  ↻ {reset}", DIM) if reset else ""))
+        out.append("")
+    out.append(" " + paint("─" * 46, DIM))
+    width = max(len(store.label(a)) for a, _, _ in order)
+    for n, (acct, ok, reason) in enumerate(order, 1):
+        out.append((" queue  " if n == 1 else "        ") + paint(str(n), ORANGE if acct == active else "") + " "
+                   + paint(f"{store.label(acct):<{width}}", BOLD if acct == active else "" if ok else DIM)
+                   + "  " + paint(reason, DIM if ok else RED))
+    held = store.state.get("held") or {}
+    if held.get("until", 0) > now:
+        out.append(" held   " + paint(store.label(held["acct"]), BOLD)
+                   + paint(f" until {fmt_time(held['until'])} · claude-accounts auto to release", DIM))
+    def meter(lead, label, left, cap, note):
+        share = left / cap * 100 if cap else 0
+        filled = round(share / 100 * 12)
+        return (f" {lead:<5} {label:<4} ▕" + paint("█" * filled, level(100 - share)) + paint("░" * (12 - filled), DIM)
+                + "▏ " + paint(f"{left:.1f} of {cap:.1f}", BOLD) + paint(note, DIM))
+
+    out.append("")
+    out.append(paint(" fuel in full 5x windows of work" + (" · estimate" if estimated else ""), DIM))
+    out.append(meter("", "5h", now_left, now_cap, (" · week-capped" if week_capped else "")
+                                                  + (f" · refills {fmt_reset(min(five_back))}" if five_back else "")))
+    soonest = min(week_refill) if week_refill else None
+    out.append(meter("", "week", week_left, week_cap,
+                     f" · +{week_refill[soonest]:.1f} at {fmt_reset(soonest)}" if soonest else ""))
+    on_off = lambda flag: paint("ON", GREEN) if flag else paint("OFF", RED)
+    out.append(paint(" auto-swap ", DIM) + on_off(autoswap_on()) + paint(" · watcher ", DIM) + on_off(watcher_on())
+               + paint(" · heartbeat ", DIM) + on_off(hook_installed("UserPromptSubmit", "claude-accounts prime")))
+    return "\n".join(out)
+
+
+def cmd_usage(args):
+    with locked() as store:
+        active = sync(store)
+        if not store.accounts:
+            print("No accounts saved yet. Run: claude-accounts add")
+            return 0
+        usage, errors = fetch_all(store, active)
+        results = [(acct, usage.get(acct), errors.get(acct)) for acct in store.accounts]
+        order = rank(store, usage, time.time())
+        color = (sys.stdout.isatty() and not os.environ.get("NO_COLOR")) or bool(os.environ.get("FORCE_COLOR"))
+        print(render_usage(store, active, results, order, color))
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="claude-accounts", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="cmd")
+    sub.add_parser("list", help="list accounts")
+    sub.add_parser("add", help="log in another account")
+    sub.add_parser("use", help="switch to an account and hold it").add_argument("account", help="number or email")
+    sub.add_parser("next", help="switch to the next best account and hold it")
+    sub.add_parser("auto", help="release a hold; go back to the best account")
+    sub.add_parser("balance", help="move to the best account now").add_argument("--quiet", action="store_true")
+    sub.add_parser("watcher", help="background balancing").add_argument(
+        "action", nargs="?", choices=["on", "off", "status"], default="status")
+    sub.add_parser("remove", help="forget an account").add_argument("account", help="number or email")
+    sub.add_parser("sync", help="save the live login into its slot").add_argument("--quiet", action="store_true")
+    sub.add_parser("usage", help="usage of every account")
+    sub.add_parser("prime", help="start every idle account's 5-hour window now").add_argument(
+        "--auto", action="store_true", help="hook mode: quiet, at most every 10 minutes, skips the live account")
+    sub.add_parser("hook", help="StopFailure hook entry point")
+    argv = sys.argv[1:]
+    if os.path.basename(sys.argv[0]) == "claude-usage":
+        argv = ["usage"] + argv
+    args = parser.parse_args(argv)
+    handlers = {"list": cmd_list, "add": cmd_add, "use": cmd_use, "next": cmd_next, "auto": cmd_auto,
+                "balance": cmd_balance, "watcher": cmd_watcher, "remove": cmd_remove, "sync": cmd_sync,
+                "usage": cmd_usage, "prime": cmd_prime, "hook": cmd_hook}
+    try:
+        return handlers[args.cmd or "list"](args)
+    except Fail as e:
+        if args.cmd == "hook":
+            notify(f"Auto-switch failed: {e}")
+            return 0
+        print(f"claude-accounts: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
