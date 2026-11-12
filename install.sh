@@ -8,8 +8,17 @@ ln -sf "$REPO/bin/claude-accounts" "$BIN/claude-accounts"
 ln -sf claude-accounts "$BIN/claude-usage"
 ln -sf "$REPO/bin/claude-net-rewake" "$BIN/claude-net-rewake"
 chmod +x "$REPO"/bin/*
-case ":$PATH:" in *":$BIN:"*) ;; *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$HOME/.zshrc"; echo "added $BIN to PATH in ~/.zshrc";; esac
-/usr/bin/python3 - "$HOME" <<'PY'
+case "$(uname -s)" in Darwin|Linux) ;; *) echo "claude-accounts supports macOS and Linux only" >&2; exit 1;; esac
+PY="$(command -v python3 || true)"
+if [ -z "$PY" ] || ! "$PY" -c 'import sys; sys.exit(sys.version_info < (3, 8))'; then
+  echo "claude-accounts needs Python 3.8+ as python3 (e.g. apt install python3)" >&2; exit 1
+fi
+case "${SHELL:-}" in */zsh) RC="$HOME/.zshrc";; */bash) RC="$HOME/.bashrc";; *) RC="$HOME/.profile";; esac
+case ":$PATH:" in *":$BIN:"*) ;; *)
+  grep -qs '.local/bin' "$RC" || echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$RC"
+  echo "added $BIN to PATH in $RC (open a new terminal)";; esac
+command -v claude >/dev/null || [ -x "$BIN/claude" ] || echo "note: Claude Code (claude) is not on PATH yet; install it before claude-accounts add" >&2
+"$PY" - "$HOME" <<'PY'
 import json, os, sys
 home = sys.argv[1]
 path = os.path.join(home, ".claude", "settings.json")

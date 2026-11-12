@@ -1,11 +1,13 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Keep several Claude subscription logins and swap between them automatically.
 
-Claude Code stores its login in the macOS keychain item "Claude Code-credentials"
-and re-reads it about every 30 seconds, so replacing that item moves every
-running session to another account without a restart. Each account's login is
-kept in its own keychain item (service "claude-accounts"); the live item is
-swapped on demand, or by the StopFailure hook when a usage limit is hit.
+On macOS Claude Code stores its login in the keychain item "Claude Code-credentials"
+and re-reads it about every 30 seconds; on Linux it stores it in
+~/.claude/.credentials.json and re-reads it when the file changes. Replacing that
+login moves every running session to another account without a restart. Each
+account's login is kept in its own slot (macOS: keychain items with service
+"claude-accounts"; Linux: 0600 files in ~/.claude/accounts/slots/); the live login
+is swapped on demand, or by the StopFailure hook when a usage limit is hit.
 
   claude-accounts                   list accounts
   claude-accounts add               log in another account (opens a login-only Claude window)
@@ -13,7 +15,7 @@ swapped on demand, or by the StopFailure hook when a usage limit is hit.
   claude-accounts next              switch to the next best account and hold it for 3 hours
   claude-accounts auto              stop holding; go back to the best account
   claude-accounts balance           move to the best account now (what the watcher runs)
-  claude-accounts watcher on|off    run `balance` every 5 minutes in the background (launchd)
+  claude-accounts watcher on|off    run `balance` every 5 minutes in the background (launchd / systemd / cron)
   claude-accounts remove <n|email>  forget an account
   claude-accounts sync              save the live login into its account slot
   claude-accounts usage             usage of every account (also available as `claude-usage`)
@@ -32,6 +34,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -45,6 +48,8 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 HOME = os.path.expanduser("~")
+# "keychain" on macOS, "file" elsewhere (Claude Code's own rule); the override exists for tests.
+BACKEND = os.environ.get("CLAUDE_ACCOUNTS_BACKEND") or ("keychain" if sys.platform == "darwin" else "file")
 DATA_DIR = os.environ.get("CLAUDE_ACCOUNTS_DIR") or os.path.join(HOME, ".claude", "accounts")
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
@@ -133,6 +138,81 @@ def kc_services(prefix):
     return set(re.findall(r'"svce"<blob>="(' + re.escape(prefix) + r'[^"]*)"', r.stdout))
 
 
+# ---------------------------------------------------------------- credential store
+#
+# The live login is the one Claude Code reads; slots hold every saved account's login. On macOS both
+# live in the keychain. Elsewhere Claude Code keeps the live login in <config dir>/.credentials.json
+# (mode 0600, symlinks refused) and reloads it when the file's mtime changes, so slots are 0600 files too.
+
+def config_dir_path(config_dir=None):
+    return config_dir or os.path.join(HOME, ".claude")
+
+
+def credentials_path(config_dir=None):
+    return os.path.join(config_dir_path(config_dir), ".credentials.json")
+
+
+def slot_path(acct):
+    return os.path.join(DATA_DIR, "slots", acct + ".json")
+
+
+def file_read(path):
+    try:
+        with open(path) as f:
+            return f.read().rstrip("\n")
+    except FileNotFoundError:
+        return None
+
+
+def file_write(path, secret):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")  # created 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(secret)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)  # a new file, so readers watching the mtime see the change
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def file_delete(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def live_read(config_dir=None):
+    if BACKEND == "keychain":
+        return kc_read(live_service(config_dir), keychain_user())
+    return file_read(credentials_path(config_dir))
+
+
+def live_write(secret, config_dir=None):
+    if BACKEND == "keychain":
+        return kc_write(live_service(config_dir), keychain_user(), secret)
+    file_write(credentials_path(config_dir), secret)
+
+
+def slot_read(acct):
+    return kc_read(SLOT_SERVICE, acct) if BACKEND == "keychain" else file_read(slot_path(acct))
+
+
+def slot_write(acct, secret):
+    if BACKEND == "keychain":
+        return kc_write(SLOT_SERVICE, acct, secret)
+    file_write(slot_path(acct), secret)
+
+
+def slot_delete(acct):
+    if BACKEND == "keychain":
+        return kc_delete(SLOT_SERVICE, acct)
+    file_delete(slot_path(acct))
+
+
 # ---------------------------------------------------------------- files
 
 def load_json(path, default):
@@ -186,8 +266,14 @@ def notify(message):
     log(message)
     if os.environ.get("CLAUDE_ACCOUNTS_NO_NOTIFY"):
         return
-    script = f"display notification {json.dumps(message, ensure_ascii=False)} with title \"Claude accounts\""
-    subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
+    try:
+        if sys.platform == "darwin":
+            script = f"display notification {json.dumps(message, ensure_ascii=False)} with title \"Claude accounts\""
+            subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=10)
+        elif shutil.which("notify-send"):
+            subprocess.run(["notify-send", "Claude accounts", message], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass  # no desktop to notify (e.g. a server); the log line above still records it
 
 
 class Store:
@@ -226,13 +312,13 @@ def fingerprint(oauth):
 
 
 def read_live():
-    raw = kc_read(live_service(os.environ.get("CLAUDE_CONFIG_DIR")), keychain_user())
+    raw = live_read(os.environ.get("CLAUDE_CONFIG_DIR"))
     if not raw:
         return None
     try:
         return json.loads(raw)
     except ValueError:
-        raise Fail("the live Claude Code keychain item is not JSON; leaving it alone")
+        raise Fail("the live Claude Code login is not JSON; leaving it alone")
 
 
 def save_slot(store, acct, profile, oauth):
@@ -240,7 +326,7 @@ def save_slot(store, acct, profile, oauth):
     rec["profile"] = profile
     rec["plan"] = oauth.get("subscriptionType")
     rec["tier"] = oauth.get("rateLimitTier")
-    kc_write(SLOT_SERVICE, acct, json.dumps(oauth, separators=(",", ":"), ensure_ascii=False))
+    slot_write(acct, json.dumps(oauth, separators=(",", ":"), ensure_ascii=False))
     rec["fp"] = fingerprint(oauth)
     store.state.get("broken", {}).pop(acct, None)
 
@@ -273,13 +359,13 @@ def sync(store):
 
 
 def switch_to(store, target, current):
-    slot = kc_read(SLOT_SERVICE, target)
+    slot = slot_read(target)
     if not slot:
         raise Fail(f"no saved login for {store.label(target)}; run: claude-accounts add")
     config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
     live = read_live() or {}
     live["claudeAiOauth"] = json.loads(slot)  # other keys in the item (e.g. MCP logins) stay as they are
-    kc_write(live_service(config_dir), keychain_user(), json.dumps(live, separators=(",", ":"), ensure_ascii=False))
+    live_write(json.dumps(live, separators=(",", ":"), ensure_ascii=False), config_dir)
     write_profile(store.accounts[target]["profile"], config_dir)
     store.state["active"] = target
     store.state["last_swap"] = {"at": time.time(), "from": current, "to": target}
@@ -433,7 +519,7 @@ def cmd_remove(args):
         if target == sync(store):
             raise Fail(f"{store.label(target)} is the live login; switch to another account first")
         label = store.label(target)
-        kc_delete(SLOT_SERVICE, target)
+        slot_delete(target)
         del store.accounts[target]
         for key in ("limited", "broken"):
             store.state.get(key, {}).pop(target, None)
@@ -446,8 +532,9 @@ def cmd_add(args):
         sync(store)  # make sure the account that's logged in right now has a slot
     os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
     login_dir = tempfile.mkdtemp(prefix="login-", dir=DATA_DIR)
+    keychain = BACKEND == "keychain"
     service, user = live_service(login_dir), keychain_user()
-    before = kc_services(LIVE_SERVICE + "-")
+    before = kc_services(LIVE_SERVICE + "-") if keychain else set()
     # A separate config dir keeps this login away from the live one; no API keys so it asks for a subscription login.
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "ANTHROPIC_"))}
     env["CLAUDE_CONFIG_DIR"] = login_dir
@@ -456,8 +543,8 @@ def cmd_add(args):
           "  2. Once it reaches the prompt, type /exit.\n")
     try:
         subprocess.run([claude_bin()], env=env, cwd=login_dir)
-        raw = kc_read(service, user)
-        if raw is None:
+        raw = kc_read(service, user) if keychain else live_read(login_dir)
+        if raw is None and keychain:
             new = kc_services(LIVE_SERVICE + "-") - before
             if len(new) == 1:
                 service = new.pop()
@@ -472,7 +559,8 @@ def cmd_add(args):
             store.state.get("limited", {}).pop(acct, None)
             print(f"Added {store.label(acct)}. Accounts now:")
     finally:
-        kc_delete(service, user)
+        if keychain:
+            kc_delete(service, user)
         shutil.rmtree(login_dir, ignore_errors=True)
     return cmd_list(args)
 
@@ -593,7 +681,7 @@ def fresh_login(store, acct, active, force=False):
     if active:
         oauth = (read_live() or {}).get("claudeAiOauth")
     else:
-        slot = kc_read(SLOT_SERVICE, acct)
+        slot = slot_read(acct)
         oauth = json.loads(slot) if slot else None
     if not oauth:
         raise Fail("no saved login; run: claude-accounts add")
@@ -606,8 +694,7 @@ def fresh_login(store, acct, active, force=False):
         if (live.get("claudeAiOauth") or {}).get("refreshToken") != oauth["refreshToken"]:
             return new
         live["claudeAiOauth"] = new
-        kc_write(live_service(os.environ.get("CLAUDE_CONFIG_DIR")), keychain_user(),
-                 json.dumps(live, separators=(",", ":"), ensure_ascii=False))
+        live_write(json.dumps(live, separators=(",", ":"), ensure_ascii=False), os.environ.get("CLAUDE_CONFIG_DIR"))
     save_slot(store, acct, store.accounts[acct]["profile"], new)
     return new
 
@@ -852,12 +939,101 @@ def watcher_plist():
     }
 
 
-def watcher_on():
-    r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True)
+SYSTEMD_UNIT = "claude-accounts-balance"
+CRON_MARK = "# claude-accounts watcher"
+
+
+def watcher_command():
+    return [sys.executable, os.path.realpath(__file__), "balance", "--quiet"]
+
+
+def systemd_dir():
+    return os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"), "systemd", "user")
+
+
+def systemd_usable():
+    if not shutil.which("systemctl"):
+        return False
+    r = subprocess.run(["systemctl", "--user", "show-environment"], capture_output=True, timeout=15)
     return r.returncode == 0
 
 
+def systemctl(*argv):
+    return subprocess.run(["systemctl", "--user", *argv], capture_output=True, text=True, timeout=30)
+
+
+def crontab_lines():
+    if not shutil.which("crontab"):
+        return None
+    r = subprocess.run(["crontab", "-l"], capture_output=True, text=True, timeout=15)
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def crontab_write(lines):
+    r = subprocess.run(["crontab", "-"], input="".join(line + "\n" for line in lines),
+                       capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        raise Fail(f"crontab failed: {(r.stderr or r.stdout).strip()}")
+
+
+def watcher_on():
+    if sys.platform == "darwin":
+        r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True)
+        return r.returncode == 0
+    if systemd_usable() and systemctl("is-active", SYSTEMD_UNIT + ".timer").stdout.strip() == "active":
+        return True
+    return any(CRON_MARK in line for line in crontab_lines() or [])
+
+
+def watcher_off_linux():
+    if os.path.exists(os.path.join(systemd_dir(), SYSTEMD_UNIT + ".timer")) and systemd_usable():
+        systemctl("disable", "--now", SYSTEMD_UNIT + ".timer")
+    for ext in (".service", ".timer"):
+        file_delete(os.path.join(systemd_dir(), SYSTEMD_UNIT + ext))
+    if systemd_usable():
+        systemctl("daemon-reload")
+    lines = crontab_lines()
+    if lines and any(CRON_MARK in line for line in lines):
+        crontab_write([line for line in lines if CRON_MARK not in line])
+
+
+def watcher_on_linux():
+    watcher_off_linux()
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    log_path = os.path.join(DATA_DIR, "watcher.log")
+    if systemd_usable():
+        os.makedirs(systemd_dir(), exist_ok=True)
+        with open(os.path.join(systemd_dir(), SYSTEMD_UNIT + ".service"), "w") as f:
+            f.write("[Unit]\nDescription=claude-accounts: move to the best Claude account\n\n"
+                    f"[Service]\nType=oneshot\nExecStart={shlex.join(watcher_command())}\n"
+                    f"StandardOutput=append:{log_path}\nStandardError=append:{log_path}\n")
+        with open(os.path.join(systemd_dir(), SYSTEMD_UNIT + ".timer"), "w") as f:
+            f.write("[Unit]\nDescription=claude-accounts balance every 5 minutes\n\n"
+                    "[Timer]\nOnBootSec=1min\nOnUnitActiveSec=5min\nPersistent=true\n\n"
+                    "[Install]\nWantedBy=timers.target\n")
+        systemctl("daemon-reload")
+        r = systemctl("enable", "--now", SYSTEMD_UNIT + ".timer")
+        if r.returncode != 0:
+            raise Fail(f"systemctl enable failed: {(r.stderr or r.stdout).strip()}")
+        return "systemd user timer; runs while you are logged in (loginctl enable-linger to keep it running after logout)"
+    lines = crontab_lines()
+    if lines is None:
+        raise Fail("neither systemd (user session) nor crontab is available; run `claude-accounts balance` yourself")
+    crontab_write(lines + [f"*/5 * * * * {shlex.join(watcher_command())} >> {shlex.quote(log_path)} 2>&1 {CRON_MARK}"])
+    return "cron, every 5 minutes"
+
+
 def cmd_watcher(args):
+    if sys.platform != "darwin":
+        if args.action == "on":
+            how = watcher_on_linux()
+            print(f"Watcher on: picks the best account every 5 minutes ({how}).")
+        elif args.action == "off":
+            watcher_off_linux()
+            print("Watcher off.")
+        else:
+            print("Watcher on." if watcher_on() else "Watcher off.")
+        return 0
     target = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
     if args.action == "on":
         os.makedirs(os.path.dirname(plist_path()), exist_ok=True)
@@ -904,7 +1080,8 @@ def heartbeat(token):
         except subprocess.TimeoutExpired:
             raise Fail("heartbeat timed out")
         finally:
-            kc_delete(live_service(tmp), keychain_user())
+            if BACKEND == "keychain":  # elsewhere any login it saved goes away with the temp dir
+                kc_delete(live_service(tmp), keychain_user())
     if r.returncode != 0:
         raise Fail(f"heartbeat failed: {(r.stderr or r.stdout).strip()[:200]}")
 
