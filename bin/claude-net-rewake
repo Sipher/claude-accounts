@@ -148,7 +148,11 @@ def probe():
     try:
         with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
             return True, f"HTTP {response.status}"
-    except urllib.error.HTTPError as e:  # any status means the network path works
+    except urllib.error.HTTPError as e:
+        # 403 (Cloudflare challenge), 429 and 5xx mean the API is still refusing us; waking now
+        # would just send another model request into the block. Any other status means it's back.
+        if e.code in (403, 429) or e.code >= 500:
+            return False, f"HTTP {e.code}"
         return True, f"HTTP {e.code}"
     except urllib.error.URLError as e:  # DNS, connect, TLS
         return False, f"{type(e.reason).__name__}: {e.reason}"

@@ -15,11 +15,12 @@ is swapped on demand, or by the StopFailure hook when a usage limit is hit.
   claude-accounts next              switch to the next best account and hold it for 3 hours
   claude-accounts auto              stop holding; go back to the best account
   claude-accounts balance           move to the best account now (what the watcher runs)
-  claude-accounts watcher on|off    run `balance` every 5 minutes in the background (launchd / systemd / cron)
+  claude-accounts watcher on|off    run `balance` every 15 minutes in the background (launchd / systemd / cron)
   claude-accounts remove <n|email>  forget an account
   claude-accounts sync              save the live login into its account slot
   claude-accounts usage             usage of every account (also available as `claude-usage`)
-  claude-accounts prime             start every idle account's 5-hour window now (a one-word Haiku request)
+  claude-accounts prime             start every idle account's 5-hour window now (one Haiku request per account, spaced out)
+  claude-accounts heartbeat on|off  let the watcher do `prime` automatically while you work (on by default)
   claude-accounts hook              StopFailure hook entry point (hook JSON on stdin)
 
 "Best" means the usable account whose weekly limit resets soonest; see rank().
@@ -39,7 +40,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 import unicodedata
 import urllib.error
@@ -75,15 +75,15 @@ WEEK_CAP = 99
 DWELL = 15 * 60       # the balancer leaves a still-usable account at most this often
 HOLD = 3 * 3600       # how long `use` and `next` override the balancer
 CACHE_AGE = 30 * 60   # how old a usage reading may be when the API can't be reached
-FRESH_AGE = float(os.environ.get("CLAUDE_ACCOUNTS_FRESH_AGE") or 60)  # reuse a reading this young instead of asking again
-BACKOFF = 5 * 60      # after the usage API answers 429, leave that account alone at least this long
+FRESH_AGE = float(os.environ.get("CLAUDE_ACCOUNTS_FRESH_AGE") or 15 * 60)  # avoid polling every account on every invocation
+BACKOFF = 15 * 60     # pause all usage polling after a rate limit, Cloudflare block, or service failure
 LAUNCHD_LABEL = os.environ.get("CLAUDE_ACCOUNTS_LAUNCHD_LABEL") or "com.claude-accounts.balance"
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 HISTORY_DAYS = 8
 DEFAULT_WINDOW_SHARE = 0.12  # share of a week one full 5-hour window uses, until measured
 MIN_SIGNAL = 40              # 5-hour percentage points of history needed to trust a measured share
 PRIME_MODEL = os.environ.get("CLAUDE_ACCOUNTS_PRIME_MODEL") or "haiku"
-PRIME_EVERY = 10 * 60      # the prompt hook checks for idle windows at most this often
+PRIME_GAP = float(os.environ.get("CLAUDE_ACCOUNTS_PRIME_GAP") or 90)  # seconds between heartbeats of different accounts
 ALL_OUT_NOTICE = 15 * 60   # repeat the "all accounts unavailable" notification at most this often
 
 MONTHS = {m: i for i, m in enumerate(
@@ -572,7 +572,7 @@ def cmd_hook(args):
         event = {}
     error = event.get("error") or ""
     session = event.get("session_id") or ""
-    text = " ".join(str(event.get(k) or "") for k in ("error_details", "last_assistant_message"))
+    text = " ".join(str(event.get(k) or "") for k in ("error", "error_details", "last_assistant_message"))
     with locked() as store:
         now = time.time()
         current = sync(store)
@@ -583,7 +583,12 @@ def cmd_hook(args):
         if now < woken:
             return 0  # a retry is already scheduled; parallel agents of one session fail together
         last = store.state.get("last_swap") or {}
-        usage, errors = fetch_all(store, current, force={current})
+        # Cloudflare's challenge is not an expired OAuth login. Rotating accounts here
+        # makes the block worse and incorrectly marks a working login as broken.
+        if error == "authentication_failed" and any(marker in text.lower() for marker in ("cloudflare", "attention required", "http 403")):
+            log("Cloudflare blocked a model request; leaving the active login unchanged")
+            return 0
+        usage, errors = fetch_all(store, current)
         known = current in usage and current not in errors
         over = any((window(usage.get(current), key)[0] or 0) >= 100 for key in ("five_hour", "seven_day"))
         # Woken after the latest swap and failed again within 10 minutes: its current login really is limited
@@ -775,22 +780,26 @@ def fetch_all(store, active, force=()):
             usage[acct] = cached["data"]
             continue
         try:
-            if acct not in force and backoff.get(acct, 0) > now:
-                raise Fail(f"usage API is rate-limiting; asking again after {fmt_time(backoff[acct])}")
+            if backoff.get("global", 0) > now:
+                raise Fail(f"usage API paused after an upstream error; retry after {fmt_time(backoff['global'])}")
+            if backoff.get(acct, 0) > now:
+                raise Fail(f"usage API paused; retry after {fmt_time(backoff[acct])}")
             usage[acct] = fresh[acct] = fetch_usage(store, acct, acct == active)
             cache[acct] = {"at": now, "data": usage[acct]}
             backoff.pop(acct, None)
             store.state.get("broken", {}).pop(acct, None)  # a live reading means the login works again
         except Fail as e:
-            if isinstance(e, HttpError) and e.status == 429:
-                backoff[acct] = now + max(e.retry_after or 0, BACKOFF)
-                e = Fail(f"usage API is rate-limiting; asking again after {fmt_time(backoff[acct])}")
+            if isinstance(e, HttpError) and e.status in (403, 429, 500, 502, 503, 504):
+                backoff["global"] = now + max(e.retry_after or 0, BACKOFF)
+                e = Fail(f"{e}; pausing all usage checks until {fmt_time(backoff['global'])}")
             errors[acct] = str(e)
             if cached and now - cached["at"] < CACHE_AGE:
                 usage[acct] = cached["data"]
                 errors[acct] += f" · showing the reading from {max(1, round((now - cached['at']) / 60))} min ago"
     for acct in [a for a in cache if a not in store.accounts]:
         del cache[acct]
+    for acct in [a for a in backoff if a != "global" and a not in store.accounts]:
+        del backoff[acct]
     record_history(fresh, now)
     return usage, errors
 
@@ -889,12 +898,27 @@ def choose(store, usage, now, exclude=None):
 
 
 def cmd_balance(args):
+    code = balance(args)
+    if getattr(args, "prime", False):
+        try:
+            prime_pass(auto=True)
+        except Fail as e:
+            log(f"auto heartbeat: {e}")
+    return code
+
+
+def balance(args):
     with locked() as store:
         now = time.time()
         current = sync(store)
         if current is None or len(store.accounts) < 2:
             return 0
-        usage, _ = fetch_all(store, current)
+        usage, errors = fetch_all(store, current)
+        # An unreachable usage API is not evidence that another login is better. (A single expired
+        # login also errors, but that must not freeze balancing forever, so only upstream pauses count.)
+        if store.state.get("usage_backoff", {}).get("global", 0) > now or current in errors:
+            log(f"balance: usage unavailable for {len(errors)} account(s); keeping active login")
+            return 0
         order = rank(store, usage, now)
         best = next(((a, r) for a, ok, r in order if ok), None)
         current_ok = any(a == current and ok for a, ok, _ in order)
@@ -929,8 +953,8 @@ def plist_path():
 def watcher_plist():
     return {
         "Label": LAUNCHD_LABEL,
-        "ProgramArguments": [os.path.realpath(__file__), "balance", "--quiet"],
-        "StartInterval": 300,
+        "ProgramArguments": [os.path.realpath(__file__), "balance", "--quiet", "--prime"],
+        "StartInterval": 900,
         "RunAtLoad": True,
         "ProcessType": "Background",
         "EnvironmentVariables": {"HOME": HOME, "USER": keychain_user(), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
@@ -944,7 +968,7 @@ CRON_MARK = "# claude-accounts watcher"
 
 
 def watcher_command():
-    return [sys.executable, os.path.realpath(__file__), "balance", "--quiet"]
+    return [sys.executable, os.path.realpath(__file__), "balance", "--quiet", "--prime"]
 
 
 def systemd_dir():
@@ -1008,8 +1032,8 @@ def watcher_on_linux():
                     f"[Service]\nType=oneshot\nExecStart={shlex.join(watcher_command())}\n"
                     f"StandardOutput=append:{log_path}\nStandardError=append:{log_path}\n")
         with open(os.path.join(systemd_dir(), SYSTEMD_UNIT + ".timer"), "w") as f:
-            f.write("[Unit]\nDescription=claude-accounts balance every 5 minutes\n\n"
-                    "[Timer]\nOnBootSec=1min\nOnUnitActiveSec=5min\nPersistent=true\n\n"
+            f.write("[Unit]\nDescription=claude-accounts balance every 15 minutes\n\n"
+                    "[Timer]\nOnBootSec=1min\nOnUnitActiveSec=15min\nPersistent=true\n\n"
                     "[Install]\nWantedBy=timers.target\n")
         systemctl("daemon-reload")
         r = systemctl("enable", "--now", SYSTEMD_UNIT + ".timer")
@@ -1019,15 +1043,15 @@ def watcher_on_linux():
     lines = crontab_lines()
     if lines is None:
         raise Fail("neither systemd (user session) nor crontab is available; run `claude-accounts balance` yourself")
-    crontab_write(lines + [f"*/5 * * * * {shlex.join(watcher_command())} >> {shlex.quote(log_path)} 2>&1 {CRON_MARK}"])
-    return "cron, every 5 minutes"
+    crontab_write(lines + [f"*/15 * * * * {shlex.join(watcher_command())} >> {shlex.quote(log_path)} 2>&1 {CRON_MARK}"])
+    return "cron, every 15 minutes"
 
 
 def cmd_watcher(args):
     if sys.platform != "darwin":
         if args.action == "on":
             how = watcher_on_linux()
-            print(f"Watcher on: picks the best account every 5 minutes ({how}).")
+            print(f"Watcher on: picks the best account every 15 minutes ({how}).")
         elif args.action == "off":
             watcher_off_linux()
             print("Watcher off.")
@@ -1045,7 +1069,7 @@ def cmd_watcher(args):
                            capture_output=True, text=True)
         if r.returncode != 0:
             raise Fail(f"launchctl bootstrap failed: {(r.stderr or r.stdout).strip()}")
-        print("Watcher on: picks the best account every 5 minutes, also after restarts.")
+        print("Watcher on: picks the best account every 15 minutes, also after restarts.")
     elif args.action == "off":
         subprocess.run(["launchctl", "bootout", target], capture_output=True)
         if os.path.exists(plist_path()):
@@ -1091,68 +1115,126 @@ def window_open(data, now):
     return reset is not None and reset > now
 
 
-def cmd_prime(args):
+UPSTREAM_MARKERS = ("403", "429", "500", "502", "503", "504", "cloudflare", "attention required",
+                    "overloaded", "rate limit", "rate_limit", "temporarily unavailable")
+
+
+def prime_lock():
+    """A non-blocking lock so two heartbeat passes (e.g. watcher + manual) never run together."""
+    os.makedirs(DATA_DIR, mode=0o700, exist_ok=True)
+    f = open(os.path.join(DATA_DIR, ".prime-lock"), "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
+def upstream_paused():
+    backoff = load_json(STATE_FILE, {}).get("usage_backoff", {})
+    return backoff.get("global", 0) > time.time()
+
+
+def prime_pass(auto):
+    """Start idle accounts' 5-hour windows, one heartbeat every PRIME_GAP seconds.
+
+    auto (the watcher): unless turned off with `claude-accounts heartbeat off`, only while someone is
+    working (the live account's window is open), never during an upstream pause, and the whole pass
+    stops at the first sign of a block. Returns {account label: report} or None when nothing ran.
+    """
     if os.environ.get("CLAUDE_ACCOUNTS_PRIMING"):
-        return 0  # never prime from inside a heartbeat
-    with locked() as store:
-        now = time.time()
-        if args.auto and now - store.state.get("prime_check", 0) < PRIME_EVERY:
-            return 0
-        store.state["prime_check"] = now
-        current = sync(store)
-        usage, errors = fetch_all(store, current)
-        report, tokens = {}, {}
-        for acct in store.accounts:
-            data = usage.get(acct)
-            week, _ = window(data, "seven_day")
-            if acct in store.state.get("broken", {}):
-                report[acct] = "skipped: login expired"
-            elif data is None:
-                report[acct] = f"skipped: {errors.get(acct, 'usage unknown')}"
-            elif window_open(data, now):
-                report[acct] = f"already running · resets {fmt_reset(window(data, 'five_hour')[1])}"
-            elif week is not None and week >= 100:
-                report[acct] = "skipped: weekly limit reached"
-            elif args.auto and acct == current:
-                report[acct] = "starts with your prompt"
-            else:
-                try:
-                    tokens[acct] = fresh_login(store, acct, acct == current)["accessToken"]
-                except Fail as e:
-                    report[acct] = f"skipped: {e}"
-        labels = {a: store.label(a) for a in store.accounts}
-    # Each heartbeat takes a few seconds: send them together, outside the lock.
-    failed = {}
-    def beat(acct):
-        try:
-            heartbeat(tokens[acct])
-        except Fail as e:
-            failed[acct] = str(e)
-    threads = [threading.Thread(target=beat, args=(acct,)) for acct in tokens]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    pending = [a for a in tokens if a not in failed]
-    for attempt in range(3):  # the usage API can take a moment to show a new window
-        if not pending:
-            break
-        if attempt:
-            time.sleep(3)
+        return None  # never prime from inside a heartbeat
+    lock = prime_lock()
+    if lock is None:
+        return None if auto else {"": "another heartbeat pass is already running"}
+    try:
         with locked() as store:
-            usage, _ = fetch_all(store, store.state.get("active"), force=set(pending))
-        for acct in [a for a in pending if window_open(usage.get(a), time.time())]:
-            report[acct] = f"window started · resets {fmt_reset(window(usage[acct], 'five_hour')[1])}"
-            pending.remove(acct)
-    for acct in failed:
-        report[acct] = f"failed: {failed[acct]}"
-    for acct in pending:
-        report[acct] = "heartbeat sent, but the usage API doesn't show a window yet"
-    for acct in tokens:
-        log(f"prime {labels[acct]}: {report[acct]}")
-    if not args.auto:
-        for acct, label in labels.items():
-            print(f"  {label:<28} {report[acct]}")
+            now = time.time()
+            if auto and not store.state.get("auto_prime", True):
+                return None
+            if store.state.get("usage_backoff", {}).get("global", 0) > now:
+                return None if auto else {"": "paused after an upstream error; try again later"}
+            current = sync(store)
+            usage, errors = fetch_all(store, current)
+            if auto and not window_open(usage.get(current), now):
+                return None  # nobody is working right now; don't keep idle accounts busy around the clock
+            report, tokens = {}, {}
+            for acct in store.accounts:
+                data = usage.get(acct)
+                week, _ = window(data, "seven_day")
+                if acct in store.state.get("broken", {}):
+                    report[acct] = "skipped: login expired"
+                elif data is None:
+                    report[acct] = f"skipped: {errors.get(acct, 'usage unknown')}"
+                elif window_open(data, now):
+                    report[acct] = f"already running · resets {fmt_reset(window(data, 'five_hour')[1])}"
+                elif week is not None and week >= 100:
+                    report[acct] = "skipped: weekly limit reached"
+                else:
+                    try:
+                        tokens[acct] = fresh_login(store, acct, acct == current)["accessToken"]
+                    except Fail as e:
+                        report[acct] = f"skipped: {e}"
+            labels = {a: store.label(a) for a in store.accounts}
+        # One heartbeat at a time, PRIME_GAP apart; stop everything at the first sign of a block.
+        sent, stopped = [], None
+        for i, acct in enumerate(tokens):
+            if stopped:
+                report[acct] = f"not sent: {stopped}"
+                continue
+            if i:
+                time.sleep(PRIME_GAP)
+            if upstream_paused():
+                stopped = "paused after an upstream error"
+                report[acct] = f"not sent: {stopped}"
+                continue
+            try:
+                heartbeat(tokens[acct])
+                sent.append(acct)
+                report[acct] = "heartbeat sent"
+            except Fail as e:
+                report[acct] = f"failed: {e}"
+                if any(m in str(e).lower() for m in UPSTREAM_MARKERS):
+                    stopped = "stopped after an upstream error"
+                    with locked() as store:
+                        backoff = store.state.setdefault("usage_backoff", {})
+                        backoff["global"] = max(backoff.get("global", 0), time.time() + BACKOFF)
+        if sent and not auto and not stopped:
+            time.sleep(3)  # let the usage endpoint catch up; check once
+            with locked() as store:
+                usage, _ = fetch_all(store, store.state.get("active"), force=set(sent))
+            for acct in sent:
+                if window_open(usage.get(acct), time.time()):
+                    report[acct] = f"window started · resets {fmt_reset(window(usage[acct], 'five_hour')[1])}"
+        for acct in tokens:
+            log(f"prime{' (auto)' if auto else ''} {labels[acct]}: {report[acct]}")
+        return {labels[a]: r for a, r in report.items()}
+    finally:
+        lock.close()
+
+
+def cmd_prime(args):
+    if args.auto:
+        return 0  # the old per-prompt hook; automatic heartbeats now run from the watcher
+    report = prime_pass(auto=False) or {}
+    for label, line in report.items():
+        print(f"  {label:<28} {line}" if label else line)
+    return 0
+
+
+def cmd_heartbeat(args):
+    with locked() as store:
+        if args.action in ("on", "off"):
+            store.state["auto_prime"] = args.action == "on"
+        on = bool(store.state.get("auto_prime", True))
+    if args.action == "on":
+        print(f"Auto heartbeat on: while you work, the watcher starts idle accounts' 5-hour windows "
+              f"one at a time, {PRIME_GAP:g}s apart, and stops at the first upstream error.")
+        if not watcher_on():
+            print("Note: the watcher is off; run: claude-accounts watcher on")
+    else:
+        print("Auto heartbeat on." if on else "Auto heartbeat off.")
     return 0
 
 
@@ -1255,7 +1337,7 @@ def render_usage(store, active, results, order, color):
                      f" · +{week_refill[soonest]:.1f} at {fmt_reset(soonest)}" if soonest else ""))
     on_off = lambda flag: paint("ON", GREEN) if flag else paint("OFF", RED)
     out.append(paint(" auto-swap ", DIM) + on_off(autoswap_on()) + paint(" · watcher ", DIM) + on_off(watcher_on())
-               + paint(" · heartbeat ", DIM) + on_off(hook_installed("UserPromptSubmit", "claude-accounts prime")))
+               + paint(" · auto heartbeat ", DIM) + on_off(bool(store.state.get("auto_prime", True))))
     return "\n".join(out)
 
 
@@ -1282,14 +1364,18 @@ def main():
     sub.add_parser("use", help="switch to an account and hold it").add_argument("account", help="number or email")
     sub.add_parser("next", help="switch to the next best account and hold it")
     sub.add_parser("auto", help="release a hold; go back to the best account")
-    sub.add_parser("balance", help="move to the best account now").add_argument("--quiet", action="store_true")
+    balance = sub.add_parser("balance", help="move to the best account now")
+    balance.add_argument("--quiet", action="store_true")
+    balance.add_argument("--prime", action="store_true", help="watcher mode: also run automatic heartbeats if on")
+    sub.add_parser("heartbeat", help="automatic heartbeats from the watcher").add_argument(
+        "action", nargs="?", choices=["on", "off", "status"], default="status")
     sub.add_parser("watcher", help="background balancing").add_argument(
         "action", nargs="?", choices=["on", "off", "status"], default="status")
     sub.add_parser("remove", help="forget an account").add_argument("account", help="number or email")
     sub.add_parser("sync", help="save the live login into its slot").add_argument("--quiet", action="store_true")
     sub.add_parser("usage", help="usage of every account")
     sub.add_parser("prime", help="start every idle account's 5-hour window now").add_argument(
-        "--auto", action="store_true", help="hook mode: quiet, at most every 10 minutes, skips the live account")
+        "--auto", action="store_true", help="ignored (old per-prompt hook); use: claude-accounts heartbeat on")
     sub.add_parser("hook", help="StopFailure hook entry point")
     argv = sys.argv[1:]
     if os.path.basename(sys.argv[0]) == "claude-usage":
@@ -1297,7 +1383,7 @@ def main():
     args = parser.parse_args(argv)
     handlers = {"list": cmd_list, "add": cmd_add, "use": cmd_use, "next": cmd_next, "auto": cmd_auto,
                 "balance": cmd_balance, "watcher": cmd_watcher, "remove": cmd_remove, "sync": cmd_sync,
-                "usage": cmd_usage, "prime": cmd_prime, "hook": cmd_hook}
+                "usage": cmd_usage, "prime": cmd_prime, "hook": cmd_hook, "heartbeat": cmd_heartbeat}
     try:
         return handlers[args.cmd or "list"](args)
     except Fail as e:

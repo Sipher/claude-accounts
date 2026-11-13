@@ -5,7 +5,9 @@ Works on **macOS and Linux** (not Windows). Needs Python 3.8+ as `python3` and C
 
 Install: `git clone https://github.com/Sipher/claude-accounts.git ~/claude-accounts && ~/claude-accounts/install.sh`
 Then run `claude-accounts add` once per account and `claude-accounts watcher on`. Check with `claude-usage`.
-Update: `git -C ~/claude-accounts pull`.
+Update: `git -C ~/claude-accounts pull && ~/claude-accounts/install.sh && claude-accounts watcher on` (rerun the installer to update hooks and reload the watcher).
+
+To avoid anti-abuse bursts, the watcher checks every 15 minutes and usage reads are cached for 15 minutes. Heartbeats (starting idle accounts' 5-hour windows) never run in parallel: `claude-accounts prime` sends them one at a time, 90 seconds apart (`CLAUDE_ACCOUNTS_PRIME_GAP` to change), and stops at the first upstream error. The watcher does this automatically, but only while you're working (the live account's window is open); `claude-accounts heartbeat off` turns that off. Upstream 403/429/5xx responses pause usage polling for at least 15 minutes; a Cloudflare 403 on a model request does not invalidate a saved login. These safeguards reduce traffic but cannot guarantee that an upstream Cloudflare block will clear.
 
 Where logins live (never copied off the machine):
 - macOS: the login keychain (Claude Code's own item, plus one `claude-accounts` item per account).
